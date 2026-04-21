@@ -210,7 +210,7 @@ This is the final and most important fix. PeppyMeter Basic defaults to
 `video.driver = dummy` which renders to nothing. It must be changed to `x11`.
 
 ```bash
-sudo nano /data/plugins/user_interface/peppymeterbasic/BasicPeppyMeter/config.txt
+sudo nano /data/plugins/user_interface/peppymeterbasic/config.txt.tmpl
 ```
 
 Find the `[sdl.env]` section and change:
