@@ -366,6 +366,11 @@ orientation. 🎉
 
 ---
 
+## Possible Gotchas
+Keep a backup of that modified /etc/systemd/system/peppymeterbasic.service file. Whenever the PeppyMeter plugin gets an update, it will likely overwrite your Environment edits and the config.txt.tmpl changes, which will "break" the meters until you re-apply those specific lines.
+
+---
+
 ## Useful Commands Reference
 
 ```bash
