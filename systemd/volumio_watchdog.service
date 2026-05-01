@@ -1,0 +1,17 @@
+[Unit]
+Description=Volumio Watchdog - Monitors playback state and notifies rfidreader
+After=volumiorfid.service
+Wants=volumiorfid.service
+
+[Service]
+Type=simple
+User=volumio
+WorkingDirectory=/home/VolumioRFID
+ExecStart=/usr/bin/python3 /home/VolumioRFID/volumio_watchdog.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
