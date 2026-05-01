@@ -20,6 +20,7 @@ This project transforms physical RFID tags into a music controller for Tidal str
 - **Smart Display Control:** Automatic screen on/off with grace periods and daily schedules
 - **Light Deduplication:** Prevents duplicate rapid plays and command stuttering
 - **Play History Tracking:** Maintains 60-day exclusion history for Magic 8-Ball fairness
+- **PeppyMeterBasic:** Music signal data transportation is handled via VolmuioRFID RPI's Group/Cast feature.
 
 ---
 
