@@ -1,11 +1,17 @@
 [Unit]
 Description=Volumio RFID Tag Reader
-After=network.target
+# Wait for network and Volumio to be ready
+After=network.target volumio.service
 
 [Service]
+Type=simple
+# Full paths are required. Change if your script name/path is different
 ExecStart=/usr/bin/python3.11 -u /home/VolumioRFID/VolumioRFID.py
-Restart=always
+WorkingDirectory=/home/VolumioRFID
+# Run as the volumio user (common on Volumio systems; change to root if needed)
 User=volumio
+Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
