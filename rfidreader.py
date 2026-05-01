@@ -1,45 +1,46 @@
 #!/usr/bin/env python3
+"""
+rfidreader.py — Dedicated RFID Pi (RPi 3B + PN532 HAT)
+
+Stable version with light sender-side deduplication.
+"""
+
 import socket
 import time
+import threading
+import RPi.GPIO as GPIO
+from pn532 import PN532_SPI
 from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import csv
 import random
 import json
 import os
 import logging
-import threading
-import socketio
-import evdev
-import struct
 import fcntl
-import RPi.GPIO as GPIO
-from gpiozero import DigitalInputDevice
-
-# Full GPIO cleanup at startup
-GPIO.setwarnings(False)
-GPIO.cleanup()
-time.sleep(0.2)
 
 # ========================= CONFIG =========================
-MAIN_PI_IP         = '192.168.1.204'
-UDP_PORT           = 5005
+VOLUMIO_PI_IP      = '192.168.1.204'
+UDP_SEND_PORT      = 5005
+UDP_LISTEN_PORT    = 5006
+HTTP_PORT          = 8080
 LED_GPIO           = 14
-SWITCH_GPIO        = 17
+
 LOCAL_CSV          = '/data/rfidreader/rfid_lookup_local.csv'
 MAGIC_HISTORY_JSON = '/data/rfidreader/magic_history.json'
 MAGIC_TAG          = "289378361"
 
-STOP_COOLDOWN_SEC  = 8
+REMOVAL_TIMEOUT    = 3.0
 MAX_HISTORY        = 2000
 EXCLUDE_DAYS       = 60
-WATCHDOG_INTERVAL  = 30   # seconds — how often to check Socket.IO connection
 
 # ========================= GLOBAL STATE =========================
-magic_active      = False
-last_trigger_time = 0.0
-last_send_time    = 0.0
-stand_event       = threading.Event()
-stand_occupied    = False
+previous_tag_id    = None
+magic_active       = False
+last_send_time     = 0.0
+last_tag_time      = 0.0
+last_sent_uri      = None
+last_sent_time     = 0.0
 
 # ========================= LOGGING =========================
 logging.basicConfig(
@@ -51,27 +52,14 @@ logging.basicConfig(
     ]
 )
 log = logging.info
-logging.getLogger('socketio').setLevel(logging.WARNING)
-logging.getLogger('engineio').setLevel(logging.WARNING)
-
-# ========================= SOCKET.IO =========================
-sio = socketio.Client(reconnection=True, reconnection_attempts=0, reconnection_delay=5)
-
-@sio.event
-def connect():
-    log("Socket.IO connected to Volumio.")
-
-@sio.event
-def disconnect():
-    log("Socket.IO disconnected from Volumio.")
 
 # ========================= HARDWARE =========================
+GPIO.setwarnings(False)
+GPIO.cleanup()
+time.sleep(0.2)
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(LED_GPIO, GPIO.OUT, initial=GPIO.LOW)
 
-light_sensor = DigitalInputDevice(SWITCH_GPIO, pull_up=True, bounce_time=0.3)
-
-# ========================= HELPERS =========================
 def flash_led(times=3):
     for _ in range(times):
         GPIO.output(LED_GPIO, GPIO.HIGH)
@@ -79,68 +67,54 @@ def flash_led(times=3):
         GPIO.output(LED_GPIO, GPIO.LOW)
         time.sleep(0.2)
 
-def send_udp(payload):
+# ========================= UDP =========================
+def send_udp(payload, ip, port):
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.sendto(json.dumps(payload).encode(), (MAIN_PI_IP, UDP_PORT))
-        sock.close()
-        log(f"Sent UDP: {payload}")
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.sendto(json.dumps(payload).encode(), (ip, port))
+            log(f"Sent UDP to {ip}:{port}: {payload}")
     except Exception as e:
-        log(f"UDP Error: {e}")
+        log(f"UDP send error: {e}")
 
-def stop_playback():
-    global magic_active
-    send_udp({"command": "stop"})
-    magic_active = False
-    log("Playback stopped — album removed from stand.")
+def send_volumio(payload):
+    global last_sent_uri, last_sent_time
+    uri = payload.get('uri')
+    now = time.time()
 
-def find_rfid_device(name_substring="ARM CM0"):
-    for path in evdev.list_devices():
-        try:
-            dev = evdev.InputDevice(path)
-            if name_substring.lower() in dev.name.lower():
-                log(f"Auto-detected reader: {dev.name} at {path}")
-                return dev
-        except:
-            continue
-    return None
+    # Light deduplication: don't send the same URI again within 2 seconds
+    if uri and uri == last_sent_uri and (now - last_sent_time) < 2.0:
+        return
 
-def convert_usb_to_pn532(usb_tag_str):
-    try:
-        val = int(usb_tag_str)
-        swapped_val = struct.unpack("<I", struct.pack(">I", val))[0]
-        return str(swapped_val)
-    except Exception as e:
-        log(f"Conversion error: {e}")
-        return usb_tag_str
+    send_udp(payload, VOLUMIO_PI_IP, UDP_SEND_PORT)
+    if uri:
+        last_sent_uri = uri
+        last_sent_time = now
 
-# ========================= CSV LOADER =========================
+# ========================= CSV & MAGIC =========================
 def load_lookup(csv_file):
     lookup_table, uris = {}, []
     try:
         with open(csv_file, 'r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                tag      = row.get('tag', '').strip().lower()
+            for row in csv.DictReader(f):
+                tag = row.get('tag', '').strip().lower()
                 location = row.get('location', '').strip()
-                service  = row.get('service', 'tidal').lower()
+                service = row.get('service', 'tidal').lower()
                 if tag and location:
                     lookup_table[tag] = {
                         'location': location,
-                        'service':  service,
-                        'artist':   row.get('artist', ''),
-                        'album':    row.get('album', '')
+                        'service': service,
+                        'artist': row.get('artist', ''),
+                        'album': row.get('album', '')
                     }
                     uris.append(location)
-        log(f"Loaded {len(lookup_table)} valid entries.")
+        log(f"Loaded {len(lookup_table)} entries from CSV.")
         return lookup_table, uris
     except Exception as e:
-        log(f"CSV Error: {e}")
+        log(f"CSV load error: {e}")
         return {}, []
 
 lookup, all_uris = load_lookup(LOCAL_CSV)
 
-# ========================= MAGIC 8-BALL =========================
 def choose_non_recent_uri():
     cutoff = datetime.now() - timedelta(days=EXCLUDE_DAYS)
     recent = set()
@@ -156,177 +130,145 @@ def choose_non_recent_uri():
     return random.choice(available)
 
 def record_magic_play(uri):
-    entry   = {"timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "uri": uri}
-    history = []
-    if os.path.exists(MAGIC_HISTORY_JSON):
-        try:
-            with open(MAGIC_HISTORY_JSON, 'r') as f:
-                history = json.load(f)
-        except:
-            pass
-    history = history[-(MAX_HISTORY - 1):] + [entry]
-    with open(MAGIC_HISTORY_JSON, 'w') as f:
-        json.dump(history, f, indent=2)
+    entry = {"timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "uri": uri}
+    try:
+        with open(MAGIC_HISTORY_JSON, 'a+') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.seek(0)
+            try:
+                history = json.loads(f.read() or '[]')
+            except:
+                history = []
+            history = history[-(MAX_HISTORY - 1):] + [entry]
+            f.seek(0)
+            f.truncate()
+            json.dump(history, f, indent=2)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        log(f"Failed to record magic play: {e}")
 
-# ========================= SOCKET.IO RECONNECT =========================
-def ensure_sio_connected():
-    """Checks Socket.IO connection and reconnects if dropped."""
-    if not sio.connected:
-        log("Socket.IO watchdog: connection lost — reconnecting...")
-        try:
-            sio.connect(f'ws://{MAIN_PI_IP}:3000', transports=['websocket'])
-            log("Socket.IO watchdog: reconnected successfully.")
-        except Exception as e:
-            log(f"Socket.IO watchdog: reconnect failed: {e}")
-
-# ========================= VOLUMIO PUSHSTATE =========================
-@sio.on('pushState')
-def on_push_state(data):
-    """
-    Receives Volumio state updates.
-    Chains next random album in Magic 8-Ball mode when playback stops,
-    but only while the album is still on the stand (GPIO17 LOW).
-    """
-    global magic_active, last_trigger_time, last_send_time
-
-    status  = data.get('status', 'unknown').lower()
-    service = data.get('service', '')
-    now     = time.time()
-
-    # Log every pushState so we can confirm they're arriving
-    log(f"pushState: status={status} service={service} magic={magic_active} "
-        f"stand={stand_occupied} since_trigger={now - last_trigger_time:.1f}s "
-        f"since_send={now - last_send_time:.1f}s")
-
-    if data.get('volatile', False) or service in ['tidalconnect', 'airplay', 'volspotconnect2']:
+def trigger_magic_8ball():
+    global magic_active, last_send_time, last_sent_uri
+    magic_active = True
+    last_send_time = time.time()
+    loc = choose_non_recent_uri()
+    if not loc:
+        log("No URIs available for Magic 8-Ball")
         return
+    send_volumio({"uri": loc, "service": "tidal", "magic": True})
+    record_magic_play(loc)
+    flash_led(5)
+    last_sent_uri = loc
+    log(f"Magic 8-Ball triggered: {loc}")
 
-    if (magic_active
-            and status == 'stop'
-            and stand_occupied
-            and now - last_trigger_time > STOP_COOLDOWN_SEC + 2
-            and now - last_send_time > 5):
-        location = choose_non_recent_uri()
-        send_udp({"uri": location, "service": "tidal"})
-        last_trigger_time = now
-        last_send_time    = now
-        record_magic_play(location)
-        log(f"Magic 8-Ball: queued next album {location}")
+# ========================= UDP LISTENER =========================
+def udp_listener():
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(('', UDP_LISTEN_PORT))
+    log(f"UDP listener started on port {UDP_LISTEN_PORT}")
 
-# ========================= IRQ CALLBACK =========================
-def on_switch_change():
-    """
-    Fires instantly on any GPIO17 edge via gpiozero.
-    Minimal work — just captures state and wakes main thread.
-    """
-    global stand_occupied
-    new_state = (light_sensor.value == 0)   # LOW = album present
-    if new_state != stand_occupied:
-        stand_occupied = new_state
-        direction = "LOW (album placed / Dark Mode)" if new_state else "HIGH (album removed / Light Mode)"
-        log(f"IRQ: GPIO17 → {direction}")
-        stand_event.set()
+    while True:
+        try:
+            data, addr = sock.recvfrom(1024)
+            payload = json.loads(data.decode().strip())
+            log(f"Callback from {addr}: {payload}")
 
-light_sensor.when_activated   = on_switch_change   # LOW  → album placed
-light_sensor.when_deactivated = on_switch_change   # HIGH → album removed
+            if payload.get('command') == 'stopped':
+                if magic_active:
+                    log("Received 'stopped' callback for Magic 8-Ball — queuing next album")
+                    trigger_magic_8ball()
+                else:
+                    log(f"Received 'stopped' callback for single album — do nothing (wait for tag removal)")
 
-# ========================= STARTUP =========================
-log("Starting RFID reader (hardware IRQ mode with gpiozero)...")
+        except Exception as e:
+            log(f"UDP listener error: {e}")
 
-rfid_dev = find_rfid_device("ARM CM0") or find_rfid_device("Keyboard")
-if not rfid_dev:
-    log("CRITICAL: No RFID reader detected.")
+# ========================= HTTP SERVER =========================
+class MagicHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/magic':
+            log("Magic 8-Ball triggered via iPhone shortcut")
+            trigger_magic_8ball()
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status": "ok"}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+def start_http_server():
+    try:
+        server = HTTPServer(('', HTTP_PORT), MagicHandler)
+        log(f"HTTP server started on port {HTTP_PORT}")
+        server.serve_forever()
+    except Exception as e:
+        log(f"HTTP server error: {e}")
+
+# ========================= PN532 =========================
+pn532 = None
+for attempt in range(3):
+    try:
+        pn532 = PN532_SPI(debug=False, reset=20, cs=4)
+        pn532.SAM_configuration()
+        log("PN532 initialized successfully")
+        break
+    except Exception as e:
+        log(f"PN532 init attempt {attempt+1} failed: {e}")
+        time.sleep(2)
+
+if pn532 is None:
+    log("CRITICAL: PN532 failed to initialize")
     exit(1)
 
-flags = fcntl.fcntl(rfid_dev.fd, fcntl.F_GETFL)
-fcntl.fcntl(rfid_dev.fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+# ========================= STARTUP =========================
+log("=== RFID Reader Started (PN532 HAT + 3-Pi Architecture) ===")
 
-try:
-    sio.connect(f'ws://{MAIN_PI_IP}:3000', transports=['websocket'])
-except Exception as e:
-    log(f"Socket.IO initial connect failed: {e}")
-
-# Capture initial stand state — fire event if album already present at startup
-stand_occupied = (light_sensor.value == 0)
-log(f"Initial stand state: {'album present (LOW/Dark)' if stand_occupied else 'empty (HIGH/Light)'}")
-if stand_occupied:
-    stand_event.set()
+threading.Thread(target=udp_listener, daemon=True).start()
+threading.Thread(target=start_http_server, daemon=True).start()
 
 # ========================= MAIN LOOP =========================
-# stand_event.wait(timeout=WATCHDOG_INTERVAL) wakes on either:
-#   a) IRQ firing (stand state changed), or
-#   b) Watchdog timeout every 30s to check Socket.IO is still alive
+previous_tag_id = None
+last_tag_time = time.time()
+
 try:
     while True:
-        triggered = stand_event.wait(timeout=WATCHDOG_INTERVAL)
+        uid = pn532.read_passive_target(timeout=0.5)
+        now = time.time()
 
-        if not triggered:
-            # Watchdog tick — no IRQ fired, just check Socket.IO health
-            ensure_sio_connected()
-            continue
-
-        stand_event.clear()
-
-        if stand_occupied:
-            # ── Album PLACED (GPIO17 went LOW) ──────────────────────────────
-            log("Album placed on stand — reading RFID tag...")
-            time.sleep(0.08)  # brief settle time
-            tag_id = None
-            current_tag_buffer = ""
-            scancodes = {2:"1", 3:"2", 4:"3", 5:"4", 6:"5",
-                         7:"6", 8:"7", 9:"8", 10:"9", 11:"0"}
-
-            try:
-                start_time = time.time()
-                for event in rfid_dev.read_loop():
-                    if time.time() - start_time > 3.0:
-                        break
-                    if event.type == evdev.ecodes.EV_KEY and event.value == 1:
-                        key = evdev.categorize(event)
-                        if key.scancode in scancodes:
-                            current_tag_buffer += scancodes[key.scancode]
-                        elif key.scancode == 28:  # Enter — end of tag
-                            if current_tag_buffer:
-                                tag_id = convert_usb_to_pn532(current_tag_buffer.strip())
-                                current_tag_buffer = ""
-                            break
-            except Exception as e:
-                log(f"RFID read error: {e}")
-
-            if tag_id is None:
-                log("No tag read (timeout or error). Returning to wait.")
-                continue
-
-            log(f"Tag read: {tag_id}")
-            last_send_time = time.time()
-
-            if tag_id == MAGIC_TAG:
-                # Magic 8-Ball: play random albums continuously
-                magic_active      = True
-                last_trigger_time = time.time()
-                loc = choose_non_recent_uri()
-                send_udp({"uri": loc, "service": "tidal"})
-                record_magic_play(loc)
-                flash_led(5)
-                log("Magic 8-Ball activated — continuous play until album removed.")
-
-            elif tag_id in lookup:
-                # Normal tag: play the associated album once
+        if uid is None:
+            # No tag detected — check for physical removal
+            if previous_tag_id is not None and (now - last_tag_time) > REMOVAL_TIMEOUT:
+                log(f"Tag {previous_tag_id} removal confirmed (timeout)")
+                send_volumio({"command": "stop"})
+                previous_tag_id = None      # Fully clear the previous tag
                 magic_active = False
-                ent = lookup[tag_id]
-                send_udp({"uri": ent['location'], "service": ent['service']})
-                flash_led(2)
-                log(f"Playing: {ent.get('artist', '')} — {ent.get('album', '')}")
-
-            else:
-                log(f"Unknown tag: {tag_id}. No action taken.")
-
+                last_tag_time = 0           # Reset timer to prevent rapid re-trigger
         else:
-            # ── Album REMOVED (GPIO17 went HIGH) ────────────────────────────
-            stop_playback()
+            tag_id = str(int.from_bytes(uid, byteorder='big'))
+            last_tag_time = now
+
+            # Only process if this is a new tag (or first tag)
+            if tag_id != previous_tag_id:
+                previous_tag_id = tag_id
+                if tag_id == MAGIC_TAG:
+                    trigger_magic_8ball()
+                elif tag_id in lookup:
+                    magic_active = False
+                    ent = lookup[tag_id]
+                    send_volumio({"uri": ent['location'], "service": ent['service'], "magic": False})
+                    flash_led(2)
+                    log(f"Playing normal tag: {ent.get('artist')} - {ent.get('album')}")
+                else:
+                    log(f"Unknown tag: {tag_id}")
 
 except KeyboardInterrupt:
     log("Shutdown requested.")
+except Exception as e:
+    log(f"Fatal error: {e}")
 finally:
     GPIO.cleanup()
     log("GPIO cleaned up.")
