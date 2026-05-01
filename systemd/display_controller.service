@@ -1,0 +1,16 @@
+[Unit]
+Description=PeppyMeters Display Controller
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /data/display_controller/display_controller.py
+WorkingDirectory=/data/display_controller
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=5
+User=volumio
+
+[Install]
+WantedBy=multi-user.target
