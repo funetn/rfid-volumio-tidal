@@ -1,6 +1,6 @@
 # RFID Whole-House Audio System: Volumio + Tidal
 
-A distributed microservices architecture for RFID-controlled Tidal music playback across multiple zones using Volumio. Play albums by scanning NFC/RFID tags, or use an iPhone shortcut for Magic 8-Ball continuous playlist shuffling.
+A distributed microservices architecture for RFID-controlled Tidal music playback across multiple zones using Volumio. Play albums by scanning NFC/RFID tags, or use an iPhone shortcut for Magic 8-Ball continuous playlist shuffling.  3 RPI's used - 1) RFID Tag reader/controller; 2) Volumio V4.x; 3) Volumio V4.x w/PeppyMeterBasic & Touch Display plugins installed on.
 
 **Version:** 3.1 | **Status:** Production Stable
 
