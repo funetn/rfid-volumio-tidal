@@ -3,6 +3,8 @@
 rfidreader.py — Dedicated RFID Pi (RPi 3B + PN532 HAT)
 
 Stable version with light sender-side deduplication.
+Rev 3.1 — Added state_lock to protect shared globals accessed from
+           main loop, UDP listener thread, and HTTP server thread.
 """
 
 import socket
@@ -41,6 +43,10 @@ last_send_time     = 0.0
 last_tag_time      = 0.0
 last_sent_uri      = None
 last_sent_time     = 0.0
+
+# Protects magic_active, last_sent_uri, last_sent_time —
+# written from main loop, UDP listener thread, and HTTP server thread.
+state_lock = threading.Lock()
 
 # ========================= LOGGING =========================
 logging.basicConfig(
@@ -81,14 +87,15 @@ def send_volumio(payload):
     uri = payload.get('uri')
     now = time.time()
 
-    # Light deduplication: don't send the same URI again within 2 seconds
-    if uri and uri == last_sent_uri and (now - last_sent_time) < 2.0:
-        return
+    with state_lock:
+        # Light deduplication: don't send the same URI again within 2 seconds
+        if uri and uri == last_sent_uri and (now - last_sent_time) < 2.0:
+            return
+        if uri:
+            last_sent_uri = uri
+            last_sent_time = now
 
     send_udp(payload, VOLUMIO_PI_IP, UDP_SEND_PORT)
-    if uri:
-        last_sent_uri = uri
-        last_sent_time = now
 
 # ========================= CSV & MAGIC =========================
 def load_lookup(csv_file):
@@ -148,17 +155,19 @@ def record_magic_play(uri):
         log(f"Failed to record magic play: {e}")
 
 def trigger_magic_8ball():
-    global magic_active, last_send_time, last_sent_uri
-    magic_active = True
-    last_send_time = time.time()
+    global magic_active, last_send_time
     loc = choose_non_recent_uri()
     if not loc:
         log("No URIs available for Magic 8-Ball")
         return
+
+    with state_lock:
+        magic_active = True
+        last_send_time = time.time()
+
     send_volumio({"uri": loc, "service": "tidal", "magic": True})
     record_magic_play(loc)
     flash_led(5)
-    last_sent_uri = loc
     log(f"Magic 8-Ball triggered: {loc}")
 
 # ========================= UDP LISTENER =========================
@@ -175,11 +184,13 @@ def udp_listener():
             log(f"Callback from {addr}: {payload}")
 
             if payload.get('command') == 'stopped':
-                if magic_active:
+                with state_lock:
+                    is_magic = magic_active
+                if is_magic:
                     log("Received 'stopped' callback for Magic 8-Ball — queuing next album")
                     trigger_magic_8ball()
                 else:
-                    log(f"Received 'stopped' callback for single album — do nothing (wait for tag removal)")
+                    log("Received 'stopped' callback for single album — do nothing (wait for tag removal)")
 
         except Exception as e:
             log(f"UDP listener error: {e}")
@@ -245,8 +256,9 @@ try:
                 log(f"Tag {previous_tag_id} removal confirmed (timeout)")
                 send_volumio({"command": "stop"})
                 previous_tag_id = None      # Fully clear the previous tag
-                magic_active = False
-                last_tag_time = 0           # Reset timer to prevent rapid re-trigger
+                with state_lock:
+                    magic_active = False
+                last_tag_time = now         # Use now rather than 0 — guard is on previous_tag_id anyway
         else:
             tag_id = str(int.from_bytes(uid, byteorder='big'))
             last_tag_time = now
@@ -257,7 +269,8 @@ try:
                 if tag_id == MAGIC_TAG:
                     trigger_magic_8ball()
                 elif tag_id in lookup:
-                    magic_active = False
+                    with state_lock:
+                        magic_active = False
                     ent = lookup[tag_id]
                     send_volumio({"uri": ent['location'], "service": ent['service'], "magic": False})
                     flash_led(2)
