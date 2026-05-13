@@ -715,6 +715,7 @@ sudo chown pi:pi /data/rfidreader/magic_history.json
 - **Tidal URI stability:** Album IDs change occasionally. Periodic CSV validation against Tidal app recommended.
 - **WiFi on rfidreader & PeppyMeters:** Recommended to use 2.4GHz for stability. Powerline adapters available as fallback.
 - **iPhone shortcut WiFi-only:** Works on home network only.
+- **Just a note:** Not really a limitation but any code changes require the service of that code (VolumioRFID.py, rfidreader.py, etc.) to be restarted with the sudo systemctl restart <xxxx> where xxxx = service to restart for changes to take effect.
 
 ---
 
