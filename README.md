@@ -202,7 +202,7 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-sudo tee /etc/systemd/system/volumio_watchdog.service > /dev/null <<EOF
+sudo tee /etc/systemd/system/volumio-watchdog.service > /dev/null <<EOF
 [Unit]
 Description=Volumio Playback Watchdog
 After=network.target
@@ -220,8 +220,8 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable VolumioRFID volumio_watchdog
-sudo systemctl start VolumioRFID volumio_watchdog
+sudo systemctl enable VolumioRFID volumio-watchdog
+sudo systemctl start VolumioRFID volumio-watchdog
 ```
 
 ### 5. Deploy display_controller Pi (192.168.1.206)
@@ -423,7 +423,7 @@ sudo systemctl start display-off.service
 # Check current status
 rfidreader RPI - sudo systemctl status rfidreader
 VolumioRFID RPI - sudo systemctl status VolumioRFID
-VolumioRFID - sudo systemctl status volumio_watchdog
+VolumioRFID - sudo systemctl status volumio-watchdog
 PeppyMeters RPI -sudo systemctl status display_controller
 PeppyMeters RPI - echo $(date) $(cat /sys/class/backlight/10-0045/device/backlight/10-0045/bl_power) $(printf "(0=on, 1=off)")
 ```
