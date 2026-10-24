@@ -5,6 +5,11 @@ rfidreader.py — Dedicated RFID Pi (RPi 3B + PN532 HAT)
 Stable version with light sender-side deduplication.
 Rev 3.1 — Added state_lock to protect shared globals accessed from
            main loop, UDP listener thread, and HTTP server thread.
+           Backuped to rfidreader-backup-2026-10-21.py before making Rev 3.2 changes
+Rev 3.2 - 1) Updated choose_non_recent section and upd_listener def sections to help with magic 8-Ball not working; 2) Added
+routine call in "Main Loop" to write to Magic 8-ball JSON EVER album played regardless if Magic 8-Ball or picked album.
+This will keep from same albums being played by Magic 8-Ball if it's already been played recently; 3) Updated playing logic for
+locally sourced music logic when Magic 8-Ball picks it.
 """
 
 import socket
@@ -22,7 +27,7 @@ import logging
 import fcntl
 
 # ========================= CONFIG =========================
-VOLUMIO_PI_IP      = '192.168.1.204'
+VOLUMIO_PI_IP      = '192.168.68.110'
 UDP_SEND_PORT      = 5005
 UDP_LISTEN_PORT    = 5006
 HTTP_PORT          = 8080
@@ -34,12 +39,11 @@ MAGIC_TAG          = "289378361"
 
 REMOVAL_TIMEOUT    = 3.0
 MAX_HISTORY        = 2000
-EXCLUDE_DAYS       = 60
+EXCLUDE_DAYS       = 90
 
 # ========================= GLOBAL STATE =========================
 previous_tag_id    = None
 magic_active       = False
-last_send_time     = 0.0
 last_tag_time      = 0.0
 last_sent_uri      = None
 last_sent_time     = 0.0
@@ -122,18 +126,41 @@ def load_lookup(csv_file):
 
 lookup, all_uris = load_lookup(LOCAL_CSV)
 
+# new routine per AI to fix random album playing within the exclude days. (old code is above)
 def choose_non_recent_uri():
     cutoff = datetime.now() - timedelta(days=EXCLUDE_DAYS)
-    recent = set()
+    
+    # Track the absolute LATEST play time for each unique URI
+    latest_plays = {} 
+    
     if os.path.exists(MAGIC_HISTORY_JSON):
         try:
             with open(MAGIC_HISTORY_JSON, 'r') as f:
-                for e in json.load(f):
-                    if datetime.strptime(e['timestamp'], '%Y-%m-%d %H:%M:%S') >= cutoff:
-                        recent.add(e['uri'])
-        except:
+                history_data = json.load(f)
+                for e in history_data:
+                    uri = e['uri']
+                    ts = datetime.strptime(e['timestamp'], '%Y-%m-%d %H:%M:%S')
+                    
+                    # Update only if this timestamp is newer than what we recorded
+                    if uri not in latest_plays or ts > latest_plays[uri]:
+                        latest_plays[uri] = ts
+        except Exception as e:
+            log(f"Error parsing magic history: {e}")
             pass
-    available = [u for u in all_uris if u not in recent] or all_uris
+
+    # A URI is excluded ONLY if its LATEST play is newer than the cutoff
+    recent = {uri for uri, last_ts in latest_plays.items() if last_ts >= cutoff}
+    
+    available = [u for u in all_uris if u not in recent]
+    
+    # Log pool size for debugging visibility
+    log(f"Magic 8-Ball pool: {len(available)} available tracks out of {len(all_uris)} total (Excluded: {len(recent)})")
+    
+    # Fallback gracefully if everything has been played recently
+    if not available:
+        log("All tracks played within EXCLUDE_DAYS window! Resetting pool to all tracks.")
+        available = all_uris
+        
     return random.choice(available)
 
 def record_magic_play(uri):
@@ -155,20 +182,31 @@ def record_magic_play(uri):
         log(f"Failed to record magic play: {e}")
 
 def trigger_magic_8ball():
-    global magic_active, last_send_time
+    global magic_active, last_sent_time
     loc = choose_non_recent_uri()
+
     if not loc:
         log("No URIs available for Magic 8-Ball")
         return
 
+    # Default to tidal if we can't find it for some reason
+    service_type = "tidal" 
+    
+    # Scan our lookup table to find the matching service for this URI
+    for tag_id, info in lookup.items():
+        if info['location'] == loc:
+            service_type = info['service']
+            break
+
     with state_lock:
         magic_active = True
-        last_send_time = time.time()
+        last_sent_time = time.time()
 
-    send_volumio({"uri": loc, "service": "tidal", "magic": True})
+    # FIX: Dynamically inject the correct service type (tidal or mpd)
+    send_volumio({"uri": loc, "service": service_type, "magic": True})
     record_magic_play(loc)
-    flash_led(5)
-    log(f"Magic 8-Ball triggered: {loc}")
+    flash_led(2)
+    log(f"Magic 8-Ball triggered ({service_type.upper()}): {loc}")
 
 # ========================= UDP LISTENER =========================
 def udp_listener():
@@ -186,8 +224,15 @@ def udp_listener():
             if payload.get('command') == 'stopped':
                 with state_lock:
                     is_magic = magic_active
+                    time_since_send = time.time() - last_sent_time
+                
+                # SAFEGUARD: Ignore 'stopped' callbacks if they happen within 5 seconds of loading a track
+                if time_since_send < 5.0:
+                    log(f"Ignored transition blip: 'stopped' callback arrived only {time_since_send:.2f}s after send.")
+                    continue
+
                 if is_magic:
-                    log("Received 'stopped' callback for Magic 8-Ball — queuing next album")
+                    log("Received genuine 'stopped' callback for Magic 8-Ball — queuing next album")
                     trigger_magic_8ball()
                 else:
                     log("Received 'stopped' callback for single album — do nothing (wait for tag removal)")
@@ -273,8 +318,9 @@ try:
                         magic_active = False
                     ent = lookup[tag_id]
                     send_volumio({"uri": ent['location'], "service": ent['service'], "magic": False})
-                    flash_led(2)
+                    flash_led(1)
                     log(f"Playing normal tag: {ent.get('artist')} - {ent.get('album')}")
+                    record_magic_play(ent['location'])     # 2026-10-23 Added this line to try and capture everything played to the magic JSON file
                 else:
                     log(f"Unknown tag: {tag_id}")
 
